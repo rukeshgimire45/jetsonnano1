@@ -1,0 +1,29 @@
+# VS Code
+.vscode/
+*.code-workspace
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+env/
+venv/
+
+# Jupyter Notebook
+.ipynb_checkpoints/
+
+# Jetson models
+models/*.engine
+models/*.onnx
+models/*.trt
+models/*.pth
+
+# Data
+data/*.jpg
+data/*.png
+data/*.mp4
+data/*.csv
+
+# Logs
+logs/*
