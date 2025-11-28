@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta
+from typing import Optional, Tuple
 
 from sqlmodel import select
 
@@ -15,9 +16,9 @@ class VisitTracker:
         self.gap = timedelta(seconds=gap_seconds)
         self._lock = threading.Lock()
 
-    def record_detection(self, label: str, timestamp: datetime) -> None:
+    def record_detection(self, label: str, timestamp: datetime) -> Tuple[bool, Optional[PersonVisit]]:
         if not label:
-            return
+            return False, None
         with self._lock:
             with session_scope() as session:
                 active = session.exec(
@@ -30,11 +31,14 @@ class VisitTracker:
                     if timestamp - active.last_seen <= self.gap:
                         active.last_seen = timestamp
                         session.add(active)
-                        return
+                        session.flush()
+                        return False, active
                     active.detection_out = active.last_seen
                     session.add(active)
                 visit = PersonVisit(label=label, detection_in=timestamp, last_seen=timestamp)
                 session.add(visit)
+                session.flush()
+                return True, visit
 
     def expire_inactive(self, timestamp: datetime) -> None:
         with self._lock:

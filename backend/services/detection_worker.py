@@ -166,15 +166,26 @@ class DetectionWorker:
             unknown_memory.remember(embedding)
 
     def _record_known_face(self, label: str, confidence: float):
+        timestamp = datetime.utcnow()
+        visit_started, _ = visit_tracker.record_detection(label, timestamp)
+        if not visit_started:
+            return
+        created_at = timestamp  # reuse visit timestamp to avoid detached SQLModel access
+
         with session_scope() as session:
             person = session.exec(select(Person).where(Person.label == label)).first()
             if person is None:
                 person = Person(label=label)
             person.total_detections += 1
-            person.last_seen = datetime.utcnow()
+            person.last_seen = created_at
             person.updated_at = datetime.utcnow()
             session.add(person)
-            event = DetectionEvent(label=label, confidence=confidence, is_known=True)
+            event = DetectionEvent(
+                label=label,
+                confidence=confidence,
+                is_known=True,
+                created_at=created_at,
+            )
             session.add(event)
             session.flush()
             payload = {
@@ -182,11 +193,10 @@ class DetectionWorker:
                 "label": label,
                 "confidence": confidence,
                 "is_known": True,
-                "created_at": event.created_at.isoformat(),
+                "created_at": created_at.isoformat(),
                 "image_url": None,
             }
         event_bus.publish_from_thread(payload)
-        visit_tracker.record_detection(label, datetime.utcnow())
 
     def _record_unknown_face(self, image_path):
         path = image_path

@@ -22,7 +22,7 @@ class AppConfig:
     face_distance_threshold: float = 0.24
     face_match_confidence: float = 0.9
     unknown_memory: int = 20
-    visit_gap_seconds: int = 10
+    visit_gap_seconds: int = 60
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
