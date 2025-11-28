@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
+
+
 import time
-import jetson.inference
-import jetson.utils
+import jetson_inference as ji
+import jetson_utils as ju
+
 
 
 def main():
     # Load SSD-Mobilenet v2 detection model
-    net = jetson.inference.detectNet("ssd-mobilenet-v2", threshold=0.5)
+    net = ji.detectNet("ssd-mobilenet-v2", threshold=0.5)
 
     # USB camera on /dev/video0 (same as detectnet)
-    camera = jetson.utils.videoSource("v4l2:///dev/video0")
+    camera = ju.videoSource("v4l2:///dev/video0")
 
     print("Starting real-time object detection (headless). Ctrl+C to stop.")
 
