@@ -6,10 +6,12 @@ import cv2
 try:
     import mediapipe as mp
     _mp_hands = mp.solutions.hands
+    _mp_face_mesh = mp.solutions.face_mesh
     _HAND_LANDMARK = _mp_hands.HandLandmark
 except ImportError:  # mediapipe may not be installed on Jetson devices
     mp = None
     _mp_hands = None
+    _mp_face_mesh = None
     _HAND_LANDMARK = None
 
 from ultralytics import YOLO
@@ -48,6 +50,16 @@ if _HAND_LANDMARK is not None:
         (_HAND_LANDMARK.RING_FINGER_TIP, _HAND_LANDMARK.RING_FINGER_PIP),
         (_HAND_LANDMARK.PINKY_TIP, _HAND_LANDMARK.PINKY_PIP)
     ]
+
+
+_FACE_FEATURE_INDICES = {}
+if _mp_face_mesh is not None:
+    _FACE_FEATURE_INDICES = {
+        "left_eye": [33, 133, 159, 145, 130, 173],
+        "right_eye": [362, 263, 386, 374, 390, 249],
+        "nose": [1, 2, 98, 327, 197, 168],
+        "mouth": [78, 308, 13, 14, 82, 87, 317, 402]
+    }
 
 
 def _is_palm_open(landmarks) -> bool:
@@ -95,6 +107,38 @@ def _detect_hand_candidates(frame_rgb, frame_w, frame_h, hands_detector):
     return overlays
 
 
+def _detect_face_part_candidates(frame_rgb, frame_w, frame_h, face_mesh_detector):
+    """Return overlays for facial parts like eyes, nose, mouth."""
+    if face_mesh_detector is None or frame_rgb is None or not _FACE_FEATURE_INDICES:
+        return []
+
+    results = face_mesh_detector.process(frame_rgb)
+    if not getattr(results, "multi_face_landmarks", None):
+        return []
+
+    overlays = []
+    for face_landmarks in results.multi_face_landmarks:
+        for label, indices in _FACE_FEATURE_INDICES.items():
+            xs = [face_landmarks.landmark[i].x for i in indices]
+            ys = [face_landmarks.landmark[i].y for i in indices]
+            x1 = max(0, int(min(xs) * frame_w))
+            y1 = max(0, int(min(ys) * frame_h))
+            x2 = min(frame_w, int(max(xs) * frame_w))
+            y2 = min(frame_h, int(max(ys) * frame_h))
+
+            if x2 <= x1 or y2 <= y1:
+                continue
+
+            overlays.append({
+                "box": (x1, y1, x2, y2),
+                "label": label,
+                "confidence": 0.9,
+                "color": _class_color(label)
+            })
+
+    return overlays
+
+
 def main():
     # --------------------
     # 1. YOLO setup (CPU-safe)
@@ -128,6 +172,16 @@ def main():
             min_tracking_confidence=0.4
         )
 
+    face_mesh_detector = None
+    if _mp_face_mesh is not None and _FACE_FEATURE_INDICES:
+        face_mesh_detector = _mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.4,
+            min_tracking_confidence=0.4
+        )
+
     timeout_count = 0
     max_timeouts = 30  # allow temporary camera hiccups
 
@@ -151,8 +205,11 @@ def main():
             frame_u8 = frame_rgba.astype(np.uint8)
             frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGBA2BGR)
             frame_h, frame_w = frame_bgr.shape[:2]
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if hands_detector is not None else None
+
+            need_rgb = hands_detector is not None or face_mesh_detector is not None
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if need_rgb else None
             hand_overlays = _detect_hand_candidates(frame_rgb, frame_w, frame_h, hands_detector)
+            face_overlays = _detect_face_part_candidates(frame_rgb, frame_w, frame_h, face_mesh_detector)
 
             # --------------------
             # 3. Run YOLO (CPU)
@@ -186,6 +243,7 @@ def main():
                 })
 
             overlays.extend(hand_overlays)
+            overlays.extend(face_overlays)
 
             for item in overlays:
                 x1_i, y1_i, x2_i, y2_i = item["box"]
@@ -235,6 +293,8 @@ def main():
     finally:
         if hands_detector is not None:
             hands_detector.close()
+        if face_mesh_detector is not None:
+            face_mesh_detector.close()
         camera.Close()
         encoder.Close()
         print("Clean shutdown complete.")
