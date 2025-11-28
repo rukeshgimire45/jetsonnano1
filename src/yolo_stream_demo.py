@@ -1,21 +1,160 @@
 import time
 import hashlib
+from datetime import datetime
+from pathlib import Path
+from collections import deque
+import urllib.request
 import numpy as np
 import cv2
 
 try:
     import mediapipe as mp
-    _mp_hands = mp.solutions.hands
+    from mediapipe.tasks import python as mp_tasks
+    from mediapipe.tasks.python import vision as mp_vision
     _mp_face_mesh = mp.solutions.face_mesh
-    _HAND_LANDMARK = _mp_hands.HandLandmark
 except ImportError:  # mediapipe may not be installed on Jetson devices
     mp = None
-    _mp_hands = None
+    mp_tasks = None
+    mp_vision = None
     _mp_face_mesh = None
-    _HAND_LANDMARK = None
 
 from ultralytics import YOLO
 import jetson_utils as ju
+
+
+FACE_DB_DIR = Path("data/faces_enroll")
+FACE_DB_DIR.mkdir(parents=True, exist_ok=True)
+
+MODEL_DIR = Path("models")
+MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+FACE_EMBEDDER_MODEL = MODEL_DIR / "face_embedder.tflite"
+FACE_EMBEDDER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/face_embedder/face_embedder/float16/1/float16.tflite"
+)
+
+FACE_DISTANCE_THRESHOLD = 0.24  # tweak if recognition is too strict/loose
+UNKNOWN_MEMORY = 20
+MAX_FACE_TRACKS = 5
+
+
+def _download_if_missing(url: str, dest: Path) -> None:
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    if dest.exists():
+        return
+
+    print(f"Downloading {url} -> {dest} ...")
+    urllib.request.urlretrieve(url, dest)
+
+
+def _create_face_embedder():
+    if mp is None or mp_tasks is None or mp_vision is None:
+        return None
+
+    try:
+        _download_if_missing(FACE_EMBEDDER_URL, FACE_EMBEDDER_MODEL)
+        base_options = mp_tasks.BaseOptions(model_asset_path=str(FACE_EMBEDDER_MODEL))
+        options = mp_vision.FaceEmbedderOptions(base_options=base_options)
+        return mp_vision.FaceEmbedder.create_from_options(options)
+    except Exception as exc:  # pragma: no cover - defensive for missing dependencies
+        print(f"Face embedder unavailable: {exc}")
+        return None
+
+
+class FaceRegistry:
+    def __init__(self, embedder, root_dir: Path = FACE_DB_DIR, distance_threshold: float = FACE_DISTANCE_THRESHOLD):
+        self.embedder = embedder
+        self.root_dir = Path(root_dir)
+        self.root_dir.mkdir(parents=True, exist_ok=True)
+        self.distance_threshold = distance_threshold
+        self.db = {}
+        self._load_existing()
+
+    def _load_existing(self):
+        for person_dir in self.root_dir.iterdir():
+            if not person_dir.is_dir():
+                continue
+            label = person_dir.name
+            for img_path in person_dir.glob("*.*"):
+                embedding = self._embedding_from_file(img_path)
+                if embedding is None:
+                    continue
+                self.db.setdefault(label, []).append(embedding)
+
+        if self.db:
+            print(f"Loaded embeddings for {len(self.db)} person(s).")
+
+    def _embedding_from_file(self, img_path: Path):
+        img = cv2.imread(str(img_path))
+        if img is None:
+            return None
+        return self.embed(img)
+
+    def embed(self, face_bgr: np.ndarray):
+        if self.embedder is None or face_bgr.size == 0:
+            return None
+
+        face_rgb = cv2.cvtColor(face_bgr, cv2.COLOR_BGR2RGB)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=face_rgb)
+        result = self.embedder.embed(mp_image)
+        if not result.embeddings:
+            return None
+        embedding = np.array(result.embeddings[0].embedding, dtype=np.float32)
+        norm = np.linalg.norm(embedding)
+        if norm == 0:
+            return None
+        return embedding / norm
+
+    def match(self, embedding: np.ndarray):
+        best_label = None
+        best_distance = 1.0
+
+        for label, vectors in self.db.items():
+            for ref in vectors:
+                distance = 1.0 - float(np.dot(ref, embedding))
+                if distance < best_distance:
+                    best_distance = distance
+                    best_label = label
+
+        if best_label is not None and best_distance <= self.distance_threshold:
+            confidence = max(0.0, 1.0 - best_distance)
+            return best_label, confidence
+        return None, None
+
+    def add(self, label: str, face_bgr: np.ndarray):
+        label = label.strip()
+        if not label:
+            return
+
+        dest_dir = self.root_dir / label
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+        img_path = dest_dir / f"face_{timestamp}.png"
+        cv2.imwrite(str(img_path), face_bgr)
+
+        embedding = self.embed(face_bgr)
+        if embedding is None:
+            print("Failed to compute embedding for new face; saved image for later.")
+            return
+
+        self.db.setdefault(label, []).append(embedding)
+        print(f"Registered new face '{label}' with snapshot {img_path}.")
+
+
+class UnknownFaceMemory:
+    def __init__(self, maxlen=UNKNOWN_MEMORY):
+        self.store = deque(maxlen=maxlen)
+
+    def should_prompt(self, embedding: np.ndarray, threshold: float = 0.1):
+        for ref in self.store:
+            distance = 1.0 - float(np.dot(ref, embedding))
+            if distance < threshold:
+                return False
+        return True
+
+    def remember(self, embedding: np.ndarray):
+        self.store.append(embedding)
 
 
 def _class_color(label: str) -> tuple:
@@ -42,98 +181,93 @@ def _draw_rect_outline(img_cuda, box, color, thickness=4):
     ju.cudaDrawRect(img_cuda, (max(x1, x2 - t), y1, x2, y2), color)
 
 
-_PALM_FINGER_PAIRS = []
-if _HAND_LANDMARK is not None:
-    _PALM_FINGER_PAIRS = [
-        (_HAND_LANDMARK.INDEX_FINGER_TIP, _HAND_LANDMARK.INDEX_FINGER_PIP),
-        (_HAND_LANDMARK.MIDDLE_FINGER_TIP, _HAND_LANDMARK.MIDDLE_FINGER_PIP),
-        (_HAND_LANDMARK.RING_FINGER_TIP, _HAND_LANDMARK.RING_FINGER_PIP),
-        (_HAND_LANDMARK.PINKY_TIP, _HAND_LANDMARK.PINKY_PIP)
-    ]
-
-
-_FACE_FEATURE_INDICES = {}
-if _mp_face_mesh is not None:
-    _FACE_FEATURE_INDICES = {
-        "left_eye": [33, 133, 159, 145, 130, 173],
-        "right_eye": [362, 263, 386, 374, 390, 249],
-        "nose": [1, 2, 98, 327, 197, 168],
-        "mouth": [78, 308, 13, 14, 82, 87, 317, 402]
-    }
-
-
-def _is_palm_open(landmarks) -> bool:
-    """Heuristic: at least three fingers extend beyond their PIP joints."""
-    if not _PALM_FINGER_PAIRS:
-        return False
-
-    extended = 0
-    for tip_idx, pip_idx in _PALM_FINGER_PAIRS:
-        tip = landmarks[tip_idx]
-        pip = landmarks[pip_idx]
-        if tip.y < pip.y:
-            extended += 1
-
-    return extended >= 3
-
-
-def _detect_hand_candidates(frame_rgb, frame_w, frame_h, hands_detector):
-    """Return overlay metadata for each detected hand/palm."""
-    if hands_detector is None or frame_rgb is None:
-        return []
-
-    results = hands_detector.process(frame_rgb)
-    if not results.multi_hand_landmarks:
-        return []
-
-    overlays = []
-    for hand_landmarks, handedness in zip(results.multi_hand_landmarks, results.multi_handedness):
-        xs = [lm.x for lm in hand_landmarks.landmark]
-        ys = [lm.y for lm in hand_landmarks.landmark]
-        x1 = max(0, int(min(xs) * frame_w))
-        y1 = max(0, int(min(ys) * frame_h))
-        x2 = min(frame_w, int(max(xs) * frame_w))
-        y2 = min(frame_h, int(max(ys) * frame_h))
-
-        score = float(handedness.classification[0].score)
-        label_base = "palm" if _is_palm_open(hand_landmarks.landmark) else "hand"
-        overlays.append({
-            "box": (x1, y1, x2, y2),
-            "label": label_base,
-            "confidence": score,
-            "color": _class_color(label_base)
-        })
-
-    return overlays
-
-
-def _detect_face_part_candidates(frame_rgb, frame_w, frame_h, face_mesh_detector):
-    """Return overlays for facial parts like eyes, nose, mouth."""
-    if face_mesh_detector is None or frame_rgb is None or not _FACE_FEATURE_INDICES:
+def _detect_faces(frame_rgb, frame_w, frame_h, face_mesh_detector):
+    """Return bounding boxes for faces detected via MediaPipe Face Mesh."""
+    if face_mesh_detector is None or frame_rgb is None:
         return []
 
     results = face_mesh_detector.process(frame_rgb)
     if not getattr(results, "multi_face_landmarks", None):
         return []
 
-    overlays = []
+    faces = []
     for face_landmarks in results.multi_face_landmarks:
-        for label, indices in _FACE_FEATURE_INDICES.items():
-            xs = [face_landmarks.landmark[i].x for i in indices]
-            ys = [face_landmarks.landmark[i].y for i in indices]
-            x1 = max(0, int(min(xs) * frame_w))
-            y1 = max(0, int(min(ys) * frame_h))
-            x2 = min(frame_w, int(max(xs) * frame_w))
-            y2 = min(frame_h, int(max(ys) * frame_h))
+        xs = [lm.x for lm in face_landmarks.landmark]
+        ys = [lm.y for lm in face_landmarks.landmark]
+        face_box = (
+            max(0, int(min(xs) * frame_w)),
+            max(0, int(min(ys) * frame_h)),
+            min(frame_w, int(max(xs) * frame_w)),
+            min(frame_h, int(max(ys) * frame_h))
+        )
+        faces.append({"box": face_box, "landmarks": face_landmarks})
 
-            if x2 <= x1 or y2 <= y1:
-                continue
+    return faces
 
+
+def _crop_with_margin(frame_bgr, box, margin: float = 0.1):
+    x1, y1, x2, y2 = box
+    w = x2 - x1
+    h = y2 - y1
+    if w <= 0 or h <= 0:
+        return None
+
+    dw = int(w * margin)
+    dh = int(h * margin)
+    x1c = max(0, x1 - dw)
+    y1c = max(0, y1 - dh)
+    x2c = min(frame_bgr.shape[1], x2 + dw)
+    y2c = min(frame_bgr.shape[0], y2 + dh)
+    crop = frame_bgr[y1c:y2c, x1c:x2c]
+    return crop.copy() if crop.size else None
+
+
+def _recognize_faces(face_entries, frame_bgr, registry, unknown_memory):
+    if registry is None or not face_entries:
+        return []
+
+    overlays = []
+    for face in face_entries:
+        x1, y1, x2, y2 = face["box"]
+        crop = _crop_with_margin(frame_bgr, (x1, y1, x2, y2))
+        if crop is None:
+            continue
+
+        embedding = registry.embed(crop)
+        if embedding is None:
+            continue
+
+        match_label, confidence = registry.match(embedding)
+        if match_label:
+            overlays.append({
+                "box": (x1, y1, x2, y2),
+                "label": match_label,
+                "confidence": confidence or 0.9,
+                "color": _class_color(match_label)
+            })
+            continue
+
+        if not unknown_memory.should_prompt(embedding):
+            continue
+
+        timestamp = datetime.utcnow().strftime("%H:%M:%S")
+        print(f"\n[FaceID] New face detected at {timestamp}." )
+        label = input("Enter label (leave blank to skip): ").strip()
+        if label:
+            registry.add(label, crop)
             overlays.append({
                 "box": (x1, y1, x2, y2),
                 "label": label,
-                "confidence": 0.9,
+                "confidence": 0.99,
                 "color": _class_color(label)
+            })
+        else:
+            unknown_memory.remember(embedding)
+            overlays.append({
+                "box": (x1, y1, x2, y2),
+                "label": "unknown",
+                "confidence": 0.0,
+                "color": (200, 200, 200, 255)
             })
 
     return overlays
@@ -163,24 +297,19 @@ def main():
 
     # font for drawing text overlays
     font = ju.cudaFont()
-    hands_detector = None
-    if _mp_hands is not None:
-        hands_detector = _mp_hands.Hands(
-            static_image_mode=False,
-            max_num_hands=2,
-            min_detection_confidence=0.4,
-            min_tracking_confidence=0.4
-        )
-
     face_mesh_detector = None
-    if _mp_face_mesh is not None and _FACE_FEATURE_INDICES:
+    if _mp_face_mesh is not None:
         face_mesh_detector = _mp_face_mesh.FaceMesh(
             static_image_mode=False,
-            max_num_faces=1,
+            max_num_faces=MAX_FACE_TRACKS,
             refine_landmarks=True,
             min_detection_confidence=0.4,
             min_tracking_confidence=0.4
         )
+
+    face_embedder = _create_face_embedder()
+    face_registry = FaceRegistry(face_embedder) if face_embedder else None
+    unknown_memory = UnknownFaceMemory()
 
     timeout_count = 0
     max_timeouts = 30  # allow temporary camera hiccups
@@ -206,10 +335,9 @@ def main():
             frame_bgr = cv2.cvtColor(frame_u8, cv2.COLOR_RGBA2BGR)
             frame_h, frame_w = frame_bgr.shape[:2]
 
-            need_rgb = hands_detector is not None or face_mesh_detector is not None
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if need_rgb else None
-            hand_overlays = _detect_hand_candidates(frame_rgb, frame_w, frame_h, hands_detector)
-            face_overlays = _detect_face_part_candidates(frame_rgb, frame_w, frame_h, face_mesh_detector)
+            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if face_mesh_detector is not None else None
+            face_infos = _detect_faces(frame_rgb, frame_w, frame_h, face_mesh_detector)
+            face_id_overlays = _recognize_faces(face_infos, frame_bgr, face_registry, unknown_memory)
 
             # --------------------
             # 3. Run YOLO (CPU)
@@ -221,29 +349,7 @@ def main():
             # 4. Draw boxes back onto CUDA image
             # --------------------
             overlays = []
-            for box in dets:
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-                conf = float(box.conf[0])
-                cls_id = int(box.cls[0])
-                
-                if conf < 0.4:
-                    continue
-
-                x1_i, y1_i, x2_i, y2_i = map(int, (x1, y1, x2, y2))
-                
-                # Get class name and color
-                class_name = model.names.get(cls_id, str(cls_id))
-                color = _class_color(class_name)
-
-                overlays.append({
-                    "box": (x1_i, y1_i, x2_i, y2_i),
-                    "label": class_name,
-                    "confidence": conf,
-                    "color": color
-                })
-
-            overlays.extend(hand_overlays)
-            overlays.extend(face_overlays)
+            overlays.extend(face_id_overlays)
 
             for item in overlays:
                 x1_i, y1_i, x2_i, y2_i = item["box"]
@@ -291,10 +397,13 @@ def main():
         print("Interrupted by user (Ctrl+C)")
 
     finally:
-        if hands_detector is not None:
-            hands_detector.close()
         if face_mesh_detector is not None:
             face_mesh_detector.close()
+        if face_registry is not None and face_registry.embedder is not None:
+            try:
+                face_registry.embedder.close()
+            except AttributeError:
+                pass
         camera.Close()
         encoder.Close()
         print("Clean shutdown complete.")
