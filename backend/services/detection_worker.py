@@ -27,6 +27,8 @@ from ..storage import save_unknown_face, encode_image_url
 from ..events import event_bus
 from .face_registry import face_registry, unknown_memory
 from .visit_tracker import visit_tracker
+from .activity_buffer import activity_buffer
+from .activity_worker import activity_worker
 from ..stream import stream_buffer
 
 
@@ -95,7 +97,11 @@ class DetectionWorker:
 
                 stream_buffer.push_frame(frame_bgr)
 
-                visit_tracker.expire_inactive(datetime.utcnow())
+                expired = visit_tracker.expire_inactive(datetime.utcnow())
+                for label, visit_id in expired:
+                    window = activity_buffer.finalize_visit(label, visit_id)
+                    if window:
+                        activity_worker.submit(window)
 
                 frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB) if face_mesh_detector else None
                 face_infos = self._detect_faces(frame_rgb, frame_w, frame_h, face_mesh_detector)
@@ -157,7 +163,7 @@ class DetectionWorker:
                 continue
             match_label, confidence = face_registry.match(embedding)
             if match_label:
-                self._record_known_face(match_label, confidence or 0.9)
+                self._handle_known_face(match_label, confidence or 0.9, frame_bgr)
                 continue
             if not unknown_memory.should_prompt(embedding):
                 continue
@@ -165,13 +171,17 @@ class DetectionWorker:
             self._record_unknown_face(face_path)
             unknown_memory.remember(embedding)
 
-    def _record_known_face(self, label: str, confidence: float):
+    def _handle_known_face(self, label: str, confidence: float, frame_bgr) -> None:
         timestamp = datetime.utcnow()
-        visit_started, _ = visit_tracker.record_detection(label, timestamp)
+        visit_started, visit_id = visit_tracker.record_detection(label, timestamp)
+        window = activity_buffer.push_frame(label, visit_id, frame_bgr, timestamp)
+        if window:
+            activity_worker.submit(window)
         if not visit_started:
             return
-        created_at = timestamp  # reuse visit timestamp to avoid detached SQLModel access
+        self._record_detection_event(label, confidence, timestamp)
 
+    def _record_detection_event(self, label: str, confidence: float, created_at: datetime) -> None:
         with session_scope() as session:
             person = session.exec(select(Person).where(Person.label == label)).first()
             if person is None:

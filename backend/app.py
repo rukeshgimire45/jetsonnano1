@@ -9,8 +9,9 @@ from fastapi.staticfiles import StaticFiles
 from .config import config
 from .database import init_db
 from .events import event_bus
-from .routers import status, faces, detections, stream
+from .routers import status, faces, detections, stream, activities, actions
 from .services.detection_worker import detection_worker
+from .services.activity_worker import activity_worker
 
 app = FastAPI(title="Jetson Nano WebApp", version="0.1.0")
 
@@ -28,6 +29,8 @@ app.include_router(status.router)
 app.include_router(faces.router)
 app.include_router(detections.router)
 app.include_router(stream.router)
+app.include_router(activities.router)
+app.include_router(actions.router)
 
 app.mount("/media", StaticFiles(directory=str(config.root_dir)), name="media")
 app.mount(config.hls_mount, StaticFiles(directory=str(config.hls_dir)), name="hls")
@@ -37,9 +40,11 @@ app.mount(config.hls_mount, StaticFiles(directory=str(config.hls_dir)), name="hl
 async def on_startup() -> None:
     init_db()
     event_bus.attach_loop(asyncio.get_running_loop())
+    activity_worker.start()
     detection_worker.start()
 
 
 @app.on_event("shutdown")
 async def on_shutdown() -> None:
     detection_worker.stop()
+    activity_worker.stop()

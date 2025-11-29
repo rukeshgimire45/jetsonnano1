@@ -11,6 +11,8 @@ class AppConfig:
     data_dir: Path = root_dir / "data"
     enroll_dir: Path = data_dir / "faces_enroll"
     unknown_dir: Path = data_dir / "faces_unknown"
+    activity_dir: Path = data_dir / "activities"
+    activity_clip_dir: Path = activity_dir / "clips"
     db_path: Path = root_dir / "data" / "app.db"
     hls_dir: Path = root_dir / "hls"
     hls_playlist: str = "stream.m3u8"
@@ -23,12 +25,22 @@ class AppConfig:
     face_match_confidence: float = 0.9
     unknown_memory: int = 20
     visit_gap_seconds: int = 60
+    activity_enabled: bool = True
+    activity_buffer_seconds: int = 20
+    activity_window_seconds: int = 10
+    activity_sample_rate: int = 5
+    activity_frame_width: int = 320
+    activity_frame_height: int = 240
+    activity_min_confidence: float = 0.6
+    activity_model_path: Path = root_dir / "models" / "activity_classifier.onnx"
 
     def ensure_dirs(self) -> None:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         self.enroll_dir.mkdir(parents=True, exist_ok=True)
         self.unknown_dir.mkdir(parents=True, exist_ok=True)
         self.hls_dir.mkdir(parents=True, exist_ok=True)
+        self.activity_dir.mkdir(parents=True, exist_ok=True)
+        self.activity_clip_dir.mkdir(parents=True, exist_ok=True)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
 
 

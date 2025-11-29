@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import threading
 from datetime import datetime, timedelta
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List
 
 from sqlmodel import select
 
@@ -16,7 +16,7 @@ class VisitTracker:
         self.gap = timedelta(seconds=gap_seconds)
         self._lock = threading.Lock()
 
-    def record_detection(self, label: str, timestamp: datetime) -> Tuple[bool, Optional[PersonVisit]]:
+    def record_detection(self, label: str, timestamp: datetime) -> Tuple[bool, Optional[int]]:
         if not label:
             return False, None
         with self._lock:
@@ -32,15 +32,16 @@ class VisitTracker:
                         active.last_seen = timestamp
                         session.add(active)
                         session.flush()
-                        return False, active
+                        return False, active.id
                     active.detection_out = active.last_seen
                     session.add(active)
                 visit = PersonVisit(label=label, detection_in=timestamp, last_seen=timestamp)
                 session.add(visit)
                 session.flush()
-                return True, visit
+                return True, visit.id
 
-    def expire_inactive(self, timestamp: datetime) -> None:
+    def expire_inactive(self, timestamp: datetime) -> List[Tuple[str, int]]:
+        expired: List[Tuple[str, int]] = []
         with self._lock:
             with session_scope() as session:
                 active_visits = session.exec(
@@ -52,8 +53,11 @@ class VisitTracker:
                         visit.detection_out = visit.last_seen
                         session.add(visit)
                         changed = True
+                        if visit.id is not None:
+                            expired.append((visit.label, visit.id))
                 if changed:
                     session.flush()
+        return expired
 
 
 visit_tracker = VisitTracker()
